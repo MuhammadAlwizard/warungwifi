@@ -1,0 +1,16 @@
+# Personal data — never commit real income records
+data/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test runtime artifacts
+.test-runtime/
+
+# Streamlit secrets (if ever added)
+.streamlit/secrets.toml
+
+# Logs
+streamlit.log
