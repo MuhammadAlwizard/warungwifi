@@ -14,3 +14,19 @@ __pycache__/
 
 # Logs
 streamlit.log
+
+# Public-repo guard (see CLAUDE.md)
+.env.*
+!.env.example
+out
+dist
+coverage
+.claude
+*.log
+*.zip
+*.tar
+*.sql
+*.pem
+*.key
+.DS_Store
+Thumbs.db
