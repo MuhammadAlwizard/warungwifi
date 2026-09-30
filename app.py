@@ -28,10 +28,10 @@ from modules.charts import comparison_chart, daily_chart, monthly_chart, monthly
 from modules.compare import compare_frames, comparison_summary
 from modules.data_io import (
     DataValidationError,
-    UPLOAD_DIR,
     add_manual_entry,
     apply_import,
     archive_upload,
+    count_uploads,
     delete_entry,
     edit_entry,
     find_conflicts,
@@ -42,7 +42,7 @@ from modules.data_io import (
 )
 
 
-st.set_page_config(page_title="Warung WiFi — Chart Pendapatan", page_icon="📒", layout="wide")
+st.set_page_config(page_title="Warung WiFi - Chart Pendapatan", page_icon="📒", layout="wide")
 
 # Jewel-tone theme: deep magenta/wine/amethyst accents on a warm off-white ground — richer and
 # darker than a muted pastel, but no black/grey neutrals.
@@ -129,7 +129,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 def rupiah(value: float | int | None) -> str:
     if value is None or pd.isna(value):
-        return "—"
+        return "-"
     return f"Rp {float(value):,.0f}".replace(",", ".")
 
 
@@ -199,7 +199,7 @@ def show_dashboard(master: pd.DataFrame) -> None:
             two_month_line_chart(daily_aggregate(master, month_a, year_a), daily_aggregate(master, month_b, year_b), label_a, label_b),
             use_container_width=True,
         )
-        st.caption("Arahkan kursor ke titik tanggal mana pun untuk lihat nilai Bulan A, Bulan B, dan Selisihnya sekaligus — misalnya tanggal 1 Bulan A vs tanggal 1 Bulan B.")
+        st.caption("Arahkan kursor ke titik tanggal mana pun untuk lihat nilai Bulan A, Bulan B, dan Selisihnya sekaligus, misalnya tanggal 1 Bulan A vs tanggal 1 Bulan B.")
 
 
 def monthly_chart_month_name(month: int) -> str:
@@ -339,11 +339,10 @@ def show_manage_table(master: pd.DataFrame) -> None:
 
 def show_upload(master: pd.DataFrame) -> None:
     st.title("Upload Data")
-    st.write("File asli diarsipkan apa adanya di `data/uploads/`. Data baru tidak menimpa tanggal yang bentrok tanpa pilihan Anda.")
+    st.write("File asli diarsipkan apa adanya di database. Data baru tidak menimpa tanggal yang bentrok tanpa pilihan Anda.")
     upload = st.file_uploader("Pilih CSV atau Excel", type=["csv", "xlsx"])
     if not upload:
-        archives = sorted(UPLOAD_DIR.iterdir(), reverse=True) if UPLOAD_DIR.exists() else []
-        st.caption(f"Arsip upload tersimpan: {len([p for p in archives if p.is_file() and p.name != '.gitkeep'])} file")
+        st.caption(f"Arsip upload tersimpan: {count_uploads()} file")
         return
     raw = upload.getvalue()
     try:

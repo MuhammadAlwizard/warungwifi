@@ -1,22 +1,29 @@
 """Data storage, validation, imports, and audit logging.
 
-The application keeps the original upload bytes in ``data/uploads`` and stores
-normalized entries plus the change log in a local SQLite database
-(``data/warungwifi.db``). Every write goes through one transaction, so a crash
-or power loss mid-write leaves the previous data intact instead of a half-written
-file — the failure mode a plain CSV can't protect against.
+The application stores normalized entries plus the change log in either:
+- A local SQLite database (data/warungwifi.db) for local development,
+- A MariaDB database when DATABASE_URL environment variable is set.
+
+Upload archives are stored in the database (uploads table).
+Every write goes through one transaction, so a crash or power loss mid-write
+leaves the previous data intact instead of a half-written state.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import functools
+import os
+import random
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -54,14 +61,41 @@ class DataValidationError(ValueError):
     """Raised when input data does not satisfy the application schema."""
 
 
-@contextmanager
-def _connect():
-    """One transaction per call: commits on success, rolls back on any error."""
+def _get_database_url() -> str | None:
+    """Get DATABASE_URL from environment, or None if not set."""
+    return os.environ.get("DATABASE_URL")
 
+
+def _is_mariadb_mode() -> bool:
+    """Check if MariaDB mode is enabled."""
+    return _get_database_url() is not None
+
+
+def _parse_database_url(url: str) -> dict[str, str]:
+    """Parse DATABASE_URL in format mysql://USER:PASS@HOST:PORT/DBNAME."""
+    parsed = urlparse(url)
+    if parsed.scheme != "mysql":
+        raise ValueError(f"Invalid DATABASE_URL scheme: {parsed.scheme}. Expected 'mysql'.")
+    return {
+        "user": parsed.username or "",
+        "password": parsed.password or "",
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 3306,
+        "database": parsed.path.lstrip("/") or "",
+    }
+
+
+@contextmanager
+def _connect_sqlite(write: bool = False):
+    """One transaction per call: commits on success, rolls back on any error.
+    ``write=True`` takes the write lock up front (BEGIN IMMEDIATE), so a
+    read-decide-write sequence cannot interleave with another writer."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
+        if write:
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:
@@ -71,32 +105,167 @@ def _connect():
         conn.close()
 
 
-def ensure_data_files() -> None:
-    """Create the data directory and SQLite tables, then migrate any pre-SQLite CSVs."""
+@contextmanager
+def _connect_mariadb():
+    """One transaction per call for MariaDB: commits on success, rolls back on error."""
+    db_url = _get_database_url()
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not set for MariaDB mode.")
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    config = _parse_database_url(db_url)
+
+    try:
+        import pymysql
+    except ImportError:
+        raise ImportError("PyMySQL is required for MariaDB mode. Install with: pip install PyMySQL>=1.1")
+
+    conn = pymysql.connect(
+        host=config["host"],
+        port=config["port"],
+        user=config["user"],
+        password=config["password"],
+        database=config["database"],
+        charset="utf8mb4",
+        autocommit=False,
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("START TRANSACTION")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def _connect(write: bool = False):
+    """Get appropriate connection based on backend mode. On MariaDB, writers lock
+    the rows they read with SELECT ... FOR UPDATE instead."""
+    if _is_mariadb_mode():
+        with _connect_mariadb() as conn:
+            yield conn
+    else:
+        with _connect_sqlite(write=write) as conn:
+            yield conn
+
+
+_RETRYABLE_MYSQL_ERRORS = {1205, 1213}  # lock wait timeout, deadlock
+
+
+def _retry_on_deadlock(func):
+    """Re-run a whole write transaction when MariaDB aborts it as a deadlock
+    victim. Row locks on dates that do not exist yet are gap locks, so two
+    devices adding new dates at the same moment can deadlock; InnoDB rolls one
+    back and asks the client to retry, which is safe because nothing was kept."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        attempts = 6
+        for attempt in range(attempts):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                code = exc.args[0] if exc.args else None
+                if not _is_mariadb_mode() or code not in _RETRYABLE_MYSQL_ERRORS or attempt == attempts - 1:
+                    raise
+                time.sleep(random.uniform(0.02, 0.1) * (attempt + 1))
+    return wrapper
+
+
+def _execute_query(cursor, query: str, params: tuple | None = None) -> Any:
+    """Execute a query with proper parameter handling for both backends."""
+    if _is_mariadb_mode():
+        # MariaDB/PyMySQL uses %s for parameters
+        cursor.execute(query, params or ())
+    else:
+        # SQLite uses ? for parameters
+        cursor.execute(query, params or ())
+    return cursor
+
+
+def _fetchall_as_dicts(cursor) -> list[dict[str, Any]]:
+    """Fetch all results as a list of dicts."""
+    if _is_mariadb_mode():
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    else:
+        # SQLite with row_factory
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def ensure_data_files() -> None:
+    """Create SQLite tables (or verify MariaDB tables exist), then migrate any pre-SQLite CSVs.
+    In MariaDB mode, skip filesystem directory creation."""
+
+    if not _is_mariadb_mode():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
     with _connect() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS entries (
-                tanggal TEXT PRIMARY KEY,
-                pendapatan REAL NOT NULL,
-                catatan TEXT NOT NULL DEFAULT '',
-                sumber TEXT NOT NULL DEFAULT ''
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS change_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                waktu_perubahan TEXT NOT NULL,
-                tanggal_data TEXT NOT NULL DEFAULT '',
-                nilai_lama TEXT NOT NULL DEFAULT '',
-                nilai_baru TEXT NOT NULL DEFAULT '',
-                sumber TEXT NOT NULL DEFAULT '',
-                aksi TEXT NOT NULL DEFAULT ''
-            )"""
-        )
-    _migrate_legacy_csv()
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS entries (
+                    tanggal DATE PRIMARY KEY,
+                    pendapatan DOUBLE NOT NULL,
+                    catatan TEXT NOT NULL,
+                    sumber VARCHAR(255) NOT NULL DEFAULT ''
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            )
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS change_log (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    waktu_perubahan VARCHAR(40) NOT NULL,
+                    tanggal_data VARCHAR(20) NOT NULL DEFAULT '',
+                    nilai_lama VARCHAR(64) NOT NULL DEFAULT '',
+                    nilai_baru VARCHAR(64) NOT NULL DEFAULT '',
+                    sumber VARCHAR(255) NOT NULL DEFAULT '',
+                    aksi VARCHAR(32) NOT NULL DEFAULT ''
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            )
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS uploads (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    uploaded_at VARCHAR(40) NOT NULL,
+                    file_name VARCHAR(255) NOT NULL,
+                    content LONGBLOB NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            )
+            cursor.close()
+        else:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS entries (
+                    tanggal TEXT PRIMARY KEY,
+                    pendapatan REAL NOT NULL,
+                    catatan TEXT NOT NULL DEFAULT '',
+                    sumber TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS change_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    waktu_perubahan TEXT NOT NULL,
+                    tanggal_data TEXT NOT NULL DEFAULT '',
+                    nilai_lama TEXT NOT NULL DEFAULT '',
+                    nilai_baru TEXT NOT NULL DEFAULT '',
+                    sumber TEXT NOT NULL DEFAULT '',
+                    aksi TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS uploads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uploaded_at TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    content BLOB NOT NULL
+                )"""
+            )
+
+    if not _is_mariadb_mode():
+        _migrate_legacy_csv()
 
 
 def _migrate_legacy_csv() -> None:
@@ -189,36 +358,18 @@ def load_master() -> pd.DataFrame:
 
     ensure_data_files()
     with _connect() as conn:
-        frame = pd.read_sql_query("SELECT tanggal, pendapatan, catatan, sumber FROM entries", conn)
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute("SELECT tanggal, pendapatan, catatan, sumber FROM entries")
+            rows = cursor.fetchall()
+            cursor.close()
+            frame = pd.DataFrame(rows, columns=["tanggal", "pendapatan", "catatan", "sumber"])
+        else:
+            frame = pd.read_sql_query("SELECT tanggal, pendapatan, catatan, sumber FROM entries", conn)
+
     if frame.empty:
         return pd.DataFrame(columns=MASTER_COLUMNS).astype({"tanggal": "datetime64[ns]", "pendapatan": "float64"})
     return validate_entries(frame, source=None)
-
-
-def save_master(frame: pd.DataFrame) -> None:
-    """Replace the entries table in one transaction: all-or-nothing, never half-written."""
-
-    normalized = validate_entries(frame, source=None) if not frame.empty else pd.DataFrame(columns=MASTER_COLUMNS)
-    output = normalized.copy()
-    if not output.empty:
-        output["tanggal"] = output["tanggal"].dt.strftime("%Y-%m-%d")
-        output["pendapatan"] = output["pendapatan"].astype(float)
-    ensure_data_files()
-    with _connect() as conn:
-        conn.execute("DELETE FROM entries")
-        if not output.empty:
-            output.to_sql("entries", conn, if_exists="append", index=False)
-
-
-def load_change_log() -> pd.DataFrame:
-    ensure_data_files()
-    with _connect() as conn:
-        frame = pd.read_sql_query(
-            "SELECT waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi FROM change_log ORDER BY id",
-            conn,
-        )
-    frame.columns = LOG_COLUMNS
-    return frame.fillna("")
 
 
 def _value(value: object) -> str:
@@ -250,22 +401,79 @@ def append_change_logs(records: list[dict[str, object]]) -> None:
         for record in records
     ]
     with _connect() as conn:
-        conn.executemany(
-            "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            rows,
-        )
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            query = (
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) "
+                "VALUES (%s, %s, %s, %s, %s, %s)"
+            )
+            cursor.executemany(query, rows)
+            cursor.close()
+        else:
+            conn.executemany(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
 
 
-def archive_upload(file_name: str, raw_bytes: bytes) -> Path:
-    """Archive upload bytes without overwriting an earlier raw file."""
+def load_change_log() -> pd.DataFrame:
+    ensure_data_files()
+    with _connect() as conn:
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi FROM change_log ORDER BY id"
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            frame = pd.DataFrame(rows, columns=["waktu_perubahan", "tanggal_data", "nilai_lama", "nilai_baru", "sumber", "aksi"])
+        else:
+            frame = pd.read_sql_query(
+                "SELECT waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi FROM change_log ORDER BY id",
+                conn,
+            )
+
+    frame.columns = LOG_COLUMNS
+    return frame.fillna("")
+
+
+def archive_upload(file_name: str, raw_bytes: bytes) -> None:
+    """Archive upload bytes in the database."""
 
     ensure_data_files()
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(file_name).name).strip("._") or "upload"
-    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-    destination = UPLOAD_DIR / f"{stamp}_{safe_name}"
-    destination.write_bytes(raw_bytes)
-    return destination
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    with _connect() as conn:
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            query = (
+                "INSERT INTO uploads (uploaded_at, file_name, content) "
+                "VALUES (%s, %s, %s)"
+            )
+            cursor.execute(query, (timestamp, safe_name, raw_bytes))
+            cursor.close()
+        else:
+            conn.execute(
+                "INSERT INTO uploads (uploaded_at, file_name, content) VALUES (?, ?, ?)",
+                (timestamp, safe_name, raw_bytes),
+            )
+
+
+def count_uploads() -> int:
+    """Return the count of archived uploads."""
+
+    ensure_data_files()
+    with _connect() as conn:
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM uploads")
+            count = cursor.fetchone()[0]
+            cursor.close()
+            return count
+        else:
+            return conn.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]
 
 
 def _find_day_header_row(raw: pd.DataFrame, max_scan: int = 8) -> int | None:
@@ -409,11 +617,80 @@ def find_conflicts(master: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame
     return conflicts.reset_index(drop=True)
 
 
-def _replace_row(master: pd.DataFrame, date: pd.Timestamp, row: pd.Series) -> pd.DataFrame:
-    result = master[master["tanggal"] != date].copy()
-    return pd.concat([result, pd.DataFrame([row[MASTER_COLUMNS].to_dict()])], ignore_index=True)
+def _load_entries_for_dates(conn, dates: list[str]) -> dict[str, dict[str, Any]]:
+    """Load current values for a list of dates inside the caller's transaction
+    (locked with FOR UPDATE on MariaDB; SQLite already holds the write lock).
+    Returns a dict mapping 'YYYY-MM-DD' -> {'pendapatan': ..., 'catatan': ..., 'sumber': ...}"""
+
+    if not dates:
+        return {}
+
+    result = {}
+    if _is_mariadb_mode():
+        cursor = conn.cursor()
+        placeholders = ", ".join(["%s"] * len(dates))
+        query = f"SELECT tanggal, pendapatan, catatan, sumber FROM entries WHERE tanggal IN ({placeholders}) FOR UPDATE"
+        cursor.execute(query, dates)
+        for row in cursor.fetchall():
+            result[row[0].strftime("%Y-%m-%d")] = {"pendapatan": row[1], "catatan": row[2], "sumber": row[3]}
+        cursor.close()
+    else:
+        placeholders = ", ".join(["?"] * len(dates))
+        query = f"SELECT tanggal, pendapatan, catatan, sumber FROM entries WHERE tanggal IN ({placeholders})"
+        for row in conn.execute(query, dates).fetchall():
+            result[row[0]] = {"pendapatan": row[1], "catatan": row[2], "sumber": row[3]}
+
+    return result
 
 
+def _apply_row_action(
+    date: str,
+    incoming_row: dict[str, Any],
+    current_value: dict[str, Any] | None,
+    action: str,
+) -> tuple[dict[str, Any] | None, str, float]:
+    """Determine the new value and log action for one row.
+
+    Returns (new_value_dict_or_none, action_taken, log_value_baru).
+    If new_value_dict_or_none is None, the row should be deleted.
+    """
+
+    old_pendapatan = current_value["pendapatan"] if current_value else None
+    new_pendapatan = incoming_row["pendapatan"]
+
+    if current_value is None:
+        # New date: always insert
+        return (
+            {"pendapatan": new_pendapatan, "catatan": incoming_row["catatan"], "sumber": incoming_row["sumber"]},
+            "tambah",
+            float(new_pendapatan),
+        )
+
+    # Existing date: check action
+    if float(old_pendapatan) == float(new_pendapatan):
+        # Same amount: always skip
+        return (current_value, "lewati", float(old_pendapatan))
+
+    if action == "timpa":
+        return (
+            {"pendapatan": new_pendapatan, "catatan": incoming_row["catatan"], "sumber": incoming_row["sumber"]},
+            "timpa",
+            float(new_pendapatan),
+        )
+    elif action == "jumlahkan":
+        summed = float(old_pendapatan) + float(new_pendapatan)
+        catatan = incoming_row["catatan"] if str(incoming_row["catatan"]).strip() else current_value["catatan"]
+        return (
+            {"pendapatan": summed, "catatan": catatan, "sumber": incoming_row["sumber"]},
+            "jumlahkan",
+            summed,
+        )
+    else:
+        # Default: lewati
+        return (current_value, "lewati", float(old_pendapatan))
+
+
+@_retry_on_deadlock
 def apply_import(
     master: pd.DataFrame,
     incoming: pd.DataFrame,
@@ -421,94 +698,286 @@ def apply_import(
 ) -> tuple[pd.DataFrame, int]:
     """Merge incoming data with explicit actions for conflicting dates.
 
+    Reads the current database state row-by-row inside a transaction,
+    applies resolutions, and writes all changes atomically.
+
     ``resolutions`` maps an ISO date to ``timpa``, ``jumlahkan``, or ``lewati``.
-    New dates are always added.  Every row, including skipped conflicts, gets an
-    audit record.
+    New dates are always added. Every row, including skipped conflicts, gets an
+    audit record. Returns the updated master dataframe and count of changed rows.
     """
 
-    current = master.copy()
     incoming = validate_entries(incoming, source=None)
     resolutions = resolutions or {}
     logs: list[dict[str, object]] = []
     changed = 0
 
-    for _, row in incoming.iterrows():
-        date = pd.Timestamp(row["tanggal"])
-        key = date.strftime("%Y-%m-%d")
-        matches = current.index[current["tanggal"] == date].tolist()
-        if not matches:
-            current = pd.concat([current, pd.DataFrame([row[MASTER_COLUMNS].to_dict()])], ignore_index=True)
-            changed += 1
-            logs.append({"tanggal data": date, "nilai lama": "", "nilai baru": row["pendapatan"], "sumber": row["sumber"], "aksi": "tambah"})
-            continue
+    # Collect all dates we need to check
+    incoming_dates = [row["tanggal"].strftime("%Y-%m-%d") for _, row in incoming.iterrows()]
 
-        index = matches[0]
-        old_amount = current.at[index, "pendapatan"]
-        action = resolutions.get(key, "lewati")
-        if float(old_amount) == float(row["pendapatan"]):
-            action = "lewati"
-        if action == "timpa":
-            current = _replace_row(current, date, row)
-            changed += 1
-            new_amount = row["pendapatan"]
-        elif action == "jumlahkan":
-            current.at[index, "pendapatan"] = float(old_amount) + float(row["pendapatan"])
-            if str(row["catatan"]).strip():
-                current.at[index, "catatan"] = row["catatan"]
-            current.at[index, "sumber"] = row["sumber"]
-            changed += 1
-            new_amount = current.at[index, "pendapatan"]
+    # Load current values from DB inside the same (locked) transaction
+    ensure_data_files()
+    with _connect(write=True) as conn:
+        current_values = _load_entries_for_dates(conn, incoming_dates)
+
+        # Process each incoming row and build change list
+        changes: list[tuple[str, dict[str, Any] | None]] = []  # (date, new_value_or_None)
+
+        for _, row in incoming.iterrows():
+            date = pd.Timestamp(row["tanggal"])
+            date_str = date.strftime("%Y-%m-%d")
+            current = current_values.get(date_str)
+            action = resolutions.get(date_str, "lewati")
+
+            new_value, action_taken, log_value_baru = _apply_row_action(
+                date_str,
+                {
+                    "pendapatan": row["pendapatan"],
+                    "catatan": row["catatan"],
+                    "sumber": row["sumber"],
+                },
+                current,
+                action,
+            )
+
+            if new_value != current or (current is None and new_value is not None):
+                changed += 1
+
+            changes.append((date_str, new_value))
+
+            old_val = float(current["pendapatan"]) if current else ""
+            logs.append({
+                "tanggal data": date,
+                "nilai lama": old_val,
+                "nilai baru": log_value_baru,
+                "sumber": row["sumber"],
+                "aksi": action_taken,
+            })
+
+        # Write all changes in the same transaction
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            # Delete rows that are being removed
+            for date_str, new_value in changes:
+                if new_value is None:
+                    cursor.execute("DELETE FROM entries WHERE tanggal = %s", (date_str,))
+            # Upsert rows that are being added or modified
+            for date_str, new_value in changes:
+                if new_value is not None:
+                    cursor.execute(
+                        "REPLACE INTO entries (tanggal, pendapatan, catatan, sumber) VALUES (%s, %s, %s, %s)",
+                        (date_str, new_value["pendapatan"], new_value["catatan"], new_value["sumber"]),
+                    )
+            # Insert change log entries
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            log_rows = [
+                (
+                    record.get("waktu perubahan", timestamp),
+                    _value(record.get("tanggal data")),
+                    _value(record.get("nilai lama")),
+                    _value(record.get("nilai baru")),
+                    _value(record.get("sumber")),
+                    _value(record.get("aksi")),
+                )
+                for record in logs
+            ]
+            query = (
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) "
+                "VALUES (%s, %s, %s, %s, %s, %s)"
+            )
+            cursor.executemany(query, log_rows)
+            cursor.close()
         else:
-            action = "lewati"
-            new_amount = old_amount
-        logs.append({"tanggal data": date, "nilai lama": old_amount, "nilai baru": new_amount, "sumber": row["sumber"], "aksi": action})
+            # SQLite: delete and insert
+            for date_str, new_value in changes:
+                if new_value is None:
+                    conn.execute("DELETE FROM entries WHERE tanggal = ?", (date_str,))
+            for date_str, new_value in changes:
+                if new_value is not None:
+                    conn.execute(
+                        "REPLACE INTO entries (tanggal, pendapatan, catatan, sumber) VALUES (?, ?, ?, ?)",
+                        (date_str, new_value["pendapatan"], new_value["catatan"], new_value["sumber"]),
+                    )
+            # Insert change log entries
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            log_rows = [
+                (
+                    record.get("waktu perubahan", timestamp),
+                    _value(record.get("tanggal data")),
+                    _value(record.get("nilai lama")),
+                    _value(record.get("nilai baru")),
+                    _value(record.get("sumber")),
+                    _value(record.get("aksi")),
+                )
+                for record in logs
+            ]
+            conn.executemany(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                log_rows,
+            )
 
-    current = current.sort_values("tanggal").reset_index(drop=True)
-    if changed:
-        save_master(current)
-    append_change_logs(logs)
-    return current, changed
+    # Load and return the updated master
+    return load_master(), changed
 
 
 def add_manual_entry(master: pd.DataFrame, entry: dict[str, object], action: str = "tambah") -> tuple[pd.DataFrame, bool]:
-    """Add one manual entry, applying an explicit conflict action if needed."""
+    """Add one manual entry, applying an explicit conflict action if needed.
+    Returns the updated master dataframe and a boolean (True if changed)."""
 
     incoming = validate_entries(pd.DataFrame([entry]), source="manual")
-    return apply_import(master, incoming, {incoming.iloc[0]["tanggal"].strftime("%Y-%m-%d"): action})
+    updated_master, changed = apply_import(master, incoming, {incoming.iloc[0]["tanggal"].strftime("%Y-%m-%d"): action})
+    return updated_master, changed > 0
 
 
+@_retry_on_deadlock
 def edit_entry(master: pd.DataFrame, date: object, amount: object, note: str = "") -> pd.DataFrame:
-    """Edit an entry and record old/new values in the audit log."""
+    """Edit an entry and record old/new values in the audit log.
+    Returns the updated master dataframe read from the database."""
 
     target = pd.Timestamp(date)
+    date_str = target.strftime("%Y-%m-%d")
     new_amount = float(amount)
     if new_amount < 0:
         raise DataValidationError("Pendapatan tidak boleh negatif.")
-    current = master.copy()
-    matches = current.index[current["tanggal"] == target].tolist()
-    if not matches:
-        raise DataValidationError("Tanggal yang akan diedit tidak ditemukan.")
-    index = matches[0]
-    old_amount = current.at[index, "pendapatan"]
-    current.at[index, "pendapatan"] = new_amount
-    current.at[index, "catatan"] = note or ""
-    current.at[index, "sumber"] = "manual"
-    save_master(current)
-    append_change_logs([{"tanggal data": target, "nilai lama": old_amount, "nilai baru": new_amount, "sumber": "manual", "aksi": "edit"}])
+
+    ensure_data_files()
+    with _connect(write=True) as conn:
+        # Load current value
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute("SELECT pendapatan FROM entries WHERE tanggal = %s FOR UPDATE", (date_str,))
+            result = cursor.fetchone()
+            cursor.close()
+            if result is None:
+                raise DataValidationError("Tanggal yang akan diedit tidak ditemukan.")
+            old_amount = result[0]
+            # Update the entry
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE entries SET pendapatan = %s, catatan = %s, sumber = %s WHERE tanggal = %s",
+                (new_amount, note or "", "manual", date_str),
+            )
+            cursor.close()
+        else:
+            cursor = conn.execute("SELECT pendapatan FROM entries WHERE tanggal = ?", (date_str,))
+            result = cursor.fetchone()
+            if result is None:
+                raise DataValidationError("Tanggal yang akan diedit tidak ditemukan.")
+            old_amount = result[0]
+            # Update the entry
+            conn.execute(
+                "UPDATE entries SET pendapatan = ?, catatan = ?, sumber = ? WHERE tanggal = ?",
+                (new_amount, note or "", "manual", date_str),
+            )
+
+        # Log the change
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        log_row = (
+            timestamp,
+            date_str,
+            _value(float(old_amount)),
+            _value(new_amount),
+            "manual",
+            "edit",
+        )
+
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) VALUES (%s, %s, %s, %s, %s, %s)",
+                log_row,
+            )
+            cursor.close()
+        else:
+            conn.execute(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) VALUES (?, ?, ?, ?, ?, ?)",
+                log_row,
+            )
+
     return load_master()
 
 
+@_retry_on_deadlock
 def delete_entry(master: pd.DataFrame, date: object) -> pd.DataFrame:
-    """Delete one entry while retaining its former value in the audit log."""
+    """Delete one entry while retaining its former value in the audit log.
+    Returns the updated master dataframe read from the database."""
 
     target = pd.Timestamp(date)
-    current = master.copy()
-    matches = current.index[current["tanggal"] == target].tolist()
-    if not matches:
-        raise DataValidationError("Tanggal yang akan dihapus tidak ditemukan.")
-    index = matches[0]
-    old_amount = current.at[index, "pendapatan"]
-    current = current.drop(index).reset_index(drop=True)
-    save_master(current)
-    append_change_logs([{"tanggal data": target, "nilai lama": old_amount, "nilai baru": "", "sumber": "manual", "aksi": "hapus"}])
+    date_str = target.strftime("%Y-%m-%d")
+
+    ensure_data_files()
+    with _connect(write=True) as conn:
+        # Load current value
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute("SELECT pendapatan FROM entries WHERE tanggal = %s FOR UPDATE", (date_str,))
+            result = cursor.fetchone()
+            cursor.close()
+            if result is None:
+                raise DataValidationError("Tanggal yang akan dihapus tidak ditemukan.")
+            old_amount = result[0]
+            # Delete the entry
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM entries WHERE tanggal = %s", (date_str,))
+            cursor.close()
+        else:
+            cursor = conn.execute("SELECT pendapatan FROM entries WHERE tanggal = ?", (date_str,))
+            result = cursor.fetchone()
+            if result is None:
+                raise DataValidationError("Tanggal yang akan dihapus tidak ditemukan.")
+            old_amount = result[0]
+            # Delete the entry
+            conn.execute("DELETE FROM entries WHERE tanggal = ?", (date_str,))
+
+        # Log the change
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        log_row = (
+            timestamp,
+            date_str,
+            _value(float(old_amount)),
+            "",
+            "manual",
+            "hapus",
+        )
+
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) VALUES (%s, %s, %s, %s, %s, %s)",
+                log_row,
+            )
+            cursor.close()
+        else:
+            conn.execute(
+                "INSERT INTO change_log (waktu_perubahan, tanggal_data, nilai_lama, nilai_baru, sumber, aksi) VALUES (?, ?, ?, ?, ?, ?)",
+                log_row,
+            )
+
     return load_master()
+
+
+def save_master(frame: pd.DataFrame) -> None:
+    """Replace the entries table in one transaction: all-or-nothing, never half-written.
+    This is a legacy function kept for CSV migration compatibility."""
+
+    normalized = validate_entries(frame, source=None) if not frame.empty else pd.DataFrame(columns=MASTER_COLUMNS)
+    output = normalized.copy()
+    if not output.empty:
+        output["tanggal"] = output["tanggal"].dt.strftime("%Y-%m-%d")
+        output["pendapatan"] = output["pendapatan"].astype(float)
+    ensure_data_files()
+    with _connect() as conn:
+        if _is_mariadb_mode():
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM entries")
+            if not output.empty:
+                for _, row in output.iterrows():
+                    cursor.execute(
+                        "INSERT INTO entries (tanggal, pendapatan, catatan, sumber) VALUES (%s, %s, %s, %s)",
+                        (row["tanggal"], row["pendapatan"], row["catatan"], row["sumber"]),
+                    )
+            cursor.close()
+        else:
+            conn.execute("DELETE FROM entries")
+            if not output.empty:
+                output.to_sql("entries", conn, if_exists="append", index=False)

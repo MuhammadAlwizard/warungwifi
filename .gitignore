@@ -30,3 +30,7 @@ coverage
 *.key
 .DS_Store
 Thumbs.db
+.env
+venv/
+.venv/
+tmp*/
